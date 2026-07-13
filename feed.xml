@@ -6,7 +6,14 @@
     <atom:link href="https://new.justgotochina.com/feed.xml" rel="self" type="application/rss+xml"/>
     <description>Field dispatches from the ground in China.</description>
     <language>en</language>
-    <lastBuildDate>Mon, 13 Jul 2026 16:34:29 +0000</lastBuildDate>
+    <lastBuildDate>Mon, 13 Jul 2026 17:48:04 +0000</lastBuildDate>
+    <item>
+      <title>Xiaowei and the walled garden</title>
+      <link>https://new.justgotochina.com/#20260713-174804</link>
+      <guid isPermaLink="false">https://new.justgotochina.com/#20260713-174804</guid>
+      <pubDate>Mon, 13 Jul 2026 17:48:04 +0000</pubDate>
+      <description><![CDATA[Xiaowei and the walled garden<br><br>Tencent just put its AI agent, Xiaowei, into WeChat testing. Tencent has started testing a new AI assistant for WeChat, made available to a small number of users, and users interact with it via text or voice while it taps into mini-apps. Separately Tencent already integrated WeChat Pay with its self-developed AI agent WorkBuddy, enabling a closed-loop transaction where AI initiates payments and completes fund transfers after approval. That closed loop is the real story. Huawei is collaborating with Tencent to roll out AI agent functions for WeChat, integrating WorkBuddy features into Huawei smartphones. Same with Xiaomi and Oppo. When a ByteDance-ZTE phone shipped a rival assistant, it faced pushback from rivals like WeChat and Alibaba apps over security and access rights.<br><br>Been building hardware in Shenzhen long enough to know what this means for anyone shipping a device here. If your product touches payments or mini-programs you now build against WeChat's agent layer, not just its SDK, and you play by Tencent's access rules or you get cut off like Nubia did. The super app is turning into an OS.]]></description>
+    </item>
     <item>
       <title>Found a 3D printed retractable cable spool on my desk today. USB-A on one end, USB-C on t…</title>
       <link>https://new.justgotochina.com/#20260713-163429</link>

@@ -26,6 +26,8 @@ import pathlib
 import datetime
 import subprocess
 import email.utils
+import re
+import html
 
 import requests
 
@@ -272,6 +274,15 @@ def parse_li(text):
     return text, True
 
 
+def parse_context(caption):
+    """If a photo caption starts with 'ai:', the rest is context for an AI draft.
+    Returns (use_ai, body)."""
+    m = re.match(r'(?is)^\s*ai:\s*(.*)$', caption or "")
+    if m:
+        return True, m.group(1).strip()
+    return False, (caption or "")
+
+
 # --------------------------------------------------------------------------
 # LinkedIn: reminder + you-compose flow
 # --------------------------------------------------------------------------
@@ -381,7 +392,7 @@ def prompt_text(batch):
               "see all of today's posts.\nOr /skip. Explicit: /li <caption>.")
 
 
-def send_prompt(manual=False):
+def send_prompt(manual=False, extra=""):
     if not (li and li.enabled()):
         return "LinkedIn is not set up. See bot/LINKEDIN.md." if manual else None
     if not SITE_BASE_URL:
@@ -405,7 +416,7 @@ def send_prompt(manual=False):
                     img_paths.append(fp)
         img_paths = img_paths[:3]
         try:
-            draft = cap.draft_linkedin(texts, img_paths)
+            draft = cap.draft_linkedin(texts, img_paths, extra_context=extra)
         except Exception as e:
             print("linkedin draft error:", e, flush=True)
 
@@ -573,7 +584,18 @@ def answer_cb(cb_id, text=""):
         print("answer_cb error:", e, flush=True)
 
 
-def stage_draft(chat_id, tmp_paths, include):
+def send_copyable(chat_id, text):
+    """Send text as a code block so Telegram shows a one-tap copy button."""
+    try:
+        api("sendMessage", chat_id=chat_id, text=text,
+            entities=json.dumps([{"type": "pre", "offset": 0, "length": len(text)}]),
+            disable_web_page_preview="true")
+    except Exception as e:
+        print("copyable send error:", e, flush=True)
+        send(chat_id, text)
+
+
+def stage_draft(chat_id, tmp_paths, include, notes=""):
     token = uuid.uuid4().hex[:8]
     paths = []
     for i, tp in enumerate(tmp_paths):
@@ -581,15 +603,35 @@ def stage_draft(chat_id, tmp_paths, include):
         os.replace(tp, pp)
         paths.append(pp)
     try:
-        d = cap.draft(paths)
+        d = cap.draft(paths, notes)
     except Exception as e:
         print("caption draft error:", e, flush=True)
         send(chat_id, f"Couldn't draft a caption ({str(e)[:120]}). Posting without one.")
-        finalize_dispatch(chat_id, paths, "", include)
+        finalize_dispatch(chat_id, paths, notes or "", include)
         return
     PENDING[token] = {"paths": paths, "draft": d, "include": include, "chat_id": chat_id}
     send_kb(chat_id, f"Draft caption:\n\n{d}",
             [("Post", f"post:{token}"), ("Edit", f"edit:{token}"), ("Discard", f"discard:{token}")])
+
+
+def stage_text_draft(chat_id, draft, include=True):
+    token = uuid.uuid4().hex[:8]
+    PENDING[token] = {"paths": [], "draft": draft, "include": include, "chat_id": chat_id}
+    send_kb(chat_id, f"Draft post:\n\n{draft}",
+            [("Post", f"post:{token}"), ("Edit", f"edit:{token}"), ("Discard", f"discard:{token}")])
+
+
+def fetch_url_text(url, limit=6000):
+    r = requests.get(url, timeout=30, headers={"User-Agent": "Mozilla/5.0 (china-feed bot)"})
+    r.raise_for_status()
+    body = r.text
+    body = re.sub(r'(?is)<(script|style|noscript|template).*?</\1>', ' ', body)
+    mt = re.search(r'(?is)<title[^>]*>(.*?)</title>', body)
+    title = html.unescape(mt.group(1)).strip() if mt else ""
+    text = re.sub(r'(?s)<[^>]+>', ' ', body)
+    text = html.unescape(text)
+    text = re.sub(r'\s+', ' ', text).strip()
+    return title, text[:limit]
 
 
 def _cleanup_paths(paths):
@@ -681,8 +723,9 @@ def handle_callback(cb):
         finalize_dispatch(pend["chat_id"], pend["paths"], pend["draft"], pend["include"])
     elif action == "edit":
         EDIT_TOKEN = token
-        answer_cb(cb_id, "Send your caption")
-        send(chat_id, "Send the caption you want for this photo.")
+        answer_cb(cb_id, "Copy, tweak, send back")
+        send(chat_id, "Copy the draft below, edit it, and send it back to replace it:")
+        send_copyable(chat_id, pend["draft"])
     elif action == "discard":
         answer_cb(cb_id, "Discarded")
         PENDING.pop(token, None)
@@ -728,8 +771,11 @@ def flush_albums(force=False):
                 tmp = SITE_DIR / "images" / f"_albtmp-{tok}-{i}.jpg"
                 download_photo(fid, tmp)
                 tmps.append(tmp)
-            clean, include = parse_li(buf["caption"])
-            if clean or not cap_enabled():
+            use_ai, body = parse_context(buf["caption"])
+            clean, include = parse_li(body)
+            if use_ai and cap_enabled():
+                stage_draft(chat_id, tmps, include, notes=clean)
+            elif clean or not cap_enabled():
                 finalize_dispatch(chat_id, tmps, clean, include)
             else:
                 stage_draft(chat_id, tmps, include)
@@ -753,13 +799,17 @@ def handle(msg):
              "POSTING\n"
              "- Photo + caption: posts it to the site\n"
              "- Photo, no caption: Claude drafts one, you approve with a tap\n"
+             "- Photo + 'ai: your notes': Claude drafts from your notes, you approve\n"
              "- Several photos as an album: one gallery post\n"
              "- Plain text: a text-only note\n"
+             "- A website link: Claude reads it and drafts a short blog post you approve\n"
+             "- 'research: <topic>': Claude looks it up and drafts a post you approve\n"
              "- #noli in a caption: keep that one off LinkedIn\n"
              "\n"
              "LINKEDIN\n"
              f"- At {DAILY_HOUR:02d}:00 {TZ_LABEL} the bot drafts a LinkedIn post you approve (if there are new dispatches)\n"
              "- /li <caption> - post the queued dispatches to LinkedIn now\n"
+             "- /li ai: <notes> - draft the post using your notes on the day\n"
              "- /skip - don't post the queued dispatches to LinkedIn\n"
              "- /preview - show the queued LinkedIn links\n"
              "- /prompt - send the LinkedIn reminder now\n"
@@ -793,7 +843,10 @@ def handle(msg):
 
     if text == "/li" or text.startswith("/li "):
         body = text[3:].strip()
-        if body:
+        use_ai, ctx = parse_context(body)
+        if use_ai:
+            send(chat_id, send_prompt(manual=True, extra=ctx))
+        elif body:
             send(chat_id, compose_and_post(body))
         else:
             send(chat_id, send_prompt(manual=True))
@@ -818,7 +871,9 @@ def handle(msg):
         return
 
     if text.startswith("/prompt"):
-        send(chat_id, send_prompt(manual=True))
+        body = text[len("/prompt"):].strip()
+        use_ai, ctx = parse_context(body)
+        send(chat_id, send_prompt(manual=True, extra=ctx if use_ai else ""))
         return
 
     if text.startswith("/list") or text.startswith("/recent"):
@@ -851,11 +906,14 @@ def handle(msg):
         return
 
     if "photo" in msg:
-        clean, include = parse_li(caption)
+        use_ai, body = parse_context(caption)
+        clean, include = parse_li(body)
         (SITE_DIR / "images").mkdir(parents=True, exist_ok=True)
         tmp = SITE_DIR / "images" / f"_tmp-{uuid.uuid4().hex[:8]}.jpg"
         download_photo(msg["photo"][-1]["file_id"], tmp)
-        if clean or not cap_enabled():
+        if use_ai and cap_enabled():
+            stage_draft(chat_id, [tmp], include, notes=clean)
+        elif clean or not cap_enabled():
             finalize_dispatch(chat_id, [tmp], clean, include)
         else:
             stage_draft(chat_id, [tmp], include)
@@ -878,6 +936,43 @@ def handle(msg):
                 send(chat_id, "Updated." if ok else "That post is gone.")
             except subprocess.CalledProcessError as e:
                 send(chat_id, f"Updated locally but publish failed:\n{(e.stderr or str(e))[:200]}")
+            return
+        # 'research: <topic>' -> web-research it and draft a post to approve.
+        mres = re.match(r'(?is)^\s*research:\s*(.+)$', text)
+        if cap_enabled() and mres:
+            topic = mres.group(1).strip()
+            send(chat_id, "Researching...")
+            try:
+                draft = cap.research(topic)
+            except Exception as e:
+                send(chat_id, f"Couldn't research that: {str(e)[:150]}")
+                return
+            if not draft:
+                send(chat_id, "Didn't get anything usable back. Try rephrasing the topic.")
+                return
+            stage_text_draft(chat_id, draft)
+            return
+        # A website link: read it and draft a short blog post to approve.
+        if cap_enabled() and re.match(r'(?i)^https?://\S', text.strip()):
+            parts = text.strip().split(None, 1)
+            url = parts[0]
+            notes = parts[1].strip() if len(parts) > 1 else ""
+            _, notes = parse_context(notes) if notes.lower().startswith("ai:") else (False, notes)
+            send(chat_id, "Reading the link...")
+            try:
+                title, page = fetch_url_text(url)
+            except Exception as e:
+                send(chat_id, f"Couldn't fetch that link: {str(e)[:150]}")
+                return
+            if not page.strip():
+                send(chat_id, "That page had no readable text I could use.")
+                return
+            try:
+                draft = cap.blogpost(page, url, title, notes)
+            except Exception as e:
+                send(chat_id, f"Couldn't write the post: {str(e)[:150]}")
+                return
+            stage_text_draft(chat_id, f"{draft}\n\nSource: {url}")
             return
         # If the bot asked for a LinkedIn caption today, this text is the caption.
         if li_enabled() and pending_active():

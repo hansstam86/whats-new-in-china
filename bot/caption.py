@@ -87,6 +87,66 @@ def draft(image_paths, notes=""):
     return "".join(parts).strip()
 
 
+BLOG_PROMPT = (
+    "Write a very short post (at most 2 short paragraphs) in the voice of a veteran hardware "
+    "entrepreneur reporting from China, about the article below. First person, terse, "
+    "execution-first, a little opinionated. No em-dashes, no emoji, no preamble. Open with a short "
+    "title line. Add your own take, especially any hardware, China, or supply-chain angle. Do not "
+    "fabricate facts that are not in the source. Keep it tight.\n\n"
+)
+
+
+def blogpost(page_text, url, title="", notes=""):
+    key = _key()
+    if not key:
+        raise RuntimeError("ANTHROPIC_API_KEY not set")
+    prompt = BLOG_PROMPT
+    if notes:
+        prompt += f"Focus or angle the author wants: {notes}\n\n"
+    prompt += (f"Source URL: {url}\nSource title: {title}\n\n"
+               f"Source content:\n{page_text}\n\nOutput only the blog post.")
+    r = requests.post(API_URL, headers={
+        "x-api-key": key,
+        "anthropic-version": "2023-06-01",
+        "content-type": "application/json",
+    }, json={"model": _model(), "max_tokens": 800,
+             "messages": [{"role": "user", "content": prompt}]}, timeout=90)
+    if r.status_code != 200:
+        raise RuntimeError(f"API {r.status_code}: {r.text[:200]}")
+    parts = [b.get("text", "") for b in r.json().get("content", []) if b.get("type") == "text"]
+    return "".join(parts).strip()
+
+
+RESEARCH_PROMPT = (
+    "Research the following topic using web search, then write a very short post about it (at most "
+    "2 short paragraphs) in the voice of a veteran hardware entrepreneur reporting from China. First "
+    "person, terse, execution-first, a little opinionated. No em-dashes, no emoji, no preamble. Open "
+    "with a short title line. Add your own hardware, China, or supply-chain angle. Use only what you "
+    "find in search and do not fabricate specifics. If you cannot find solid information, say so "
+    "briefly rather than inventing. Keep it tight. Topic:\n\n{topic}\n\nOutput only the post."
+)
+
+
+def research(topic, notes=""):
+    key = _key()
+    if not key:
+        raise RuntimeError("ANTHROPIC_API_KEY not set")
+    prompt = RESEARCH_PROMPT.format(topic=topic)
+    if notes:
+        prompt += f"\n\nExtra focus: {notes}"
+    r = requests.post(API_URL, headers={
+        "x-api-key": key,
+        "anthropic-version": "2023-06-01",
+        "content-type": "application/json",
+    }, json={"model": _model(), "max_tokens": 500,
+             "tools": [{"type": "web_search_20250305", "name": "web_search", "max_uses": 5}],
+             "messages": [{"role": "user", "content": prompt}]}, timeout=120)
+    if r.status_code != 200:
+        raise RuntimeError(f"API {r.status_code}: {r.text[:200]}")
+    parts = [b.get("text", "") for b in r.json().get("content", []) if b.get("type") == "text"]
+    return "".join(parts).strip()
+
+
 LINKEDIN_PROMPT_HEAD = (
     "Write a short LinkedIn post for a veteran hardware entrepreneur reporting from the ground "
     "in China, summarizing today's field dispatches for a professional audience of hardware and "
@@ -97,7 +157,7 @@ LINKEDIN_PROMPT_HEAD = (
 )
 
 
-def draft_linkedin(items, image_paths=None):
+def draft_linkedin(items, image_paths=None, extra_context=""):
     key = _key()
     if not key:
         raise RuntimeError("ANTHROPIC_API_KEY not set")
@@ -110,15 +170,17 @@ def draft_linkedin(items, image_paths=None):
         except Exception:
             pass
     joined = "\n".join(f"- {t}" for t in (items or []) if t)
+    parts = []
+    if extra_context:
+        parts.append(f"The author's own notes on what they did today (use these as the main basis):\n{extra_context}")
     if joined:
-        basis = f"Base it only on these dispatch notes and do not invent specifics:\n\n{joined}"
-        if content:
-            basis += "\n\nPhotos from today's dispatches are attached for extra context."
-    elif content:
-        basis = ("Base it on the attached photos from today's dispatches. Describe only what is "
-                 "clearly visible; do not guess brand names, model numbers, prices, or specs.")
-    else:
-        basis = "Write a brief note that there are new dispatches from the ground in China today."
+        parts.append(f"Today's dispatch notes:\n{joined}")
+    if content:
+        parts.append("Photos from today's dispatches are attached; describe only what is clearly "
+                     "visible and do not guess brands, model numbers, or specs.")
+    if not parts:
+        parts.append("Write a brief note that there are new dispatches from the ground in China today.")
+    basis = "Base it only on the following and do not invent specifics:\n\n" + "\n\n".join(parts)
     prompt = LINKEDIN_PROMPT_HEAD + basis + "\n\nOutput only the post text."
 
     msg_content = content + [{"type": "text", "text": prompt}]
