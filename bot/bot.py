@@ -25,6 +25,7 @@ import time
 import pathlib
 import datetime
 import subprocess
+import email.utils
 
 import requests
 
@@ -37,6 +38,13 @@ try:
     import linkedin as li
 except Exception:
     li = None
+
+try:
+    import caption as cap
+except Exception:
+    cap = None
+
+import uuid
 
 
 def load_env(path=".env"):
@@ -64,6 +72,7 @@ if not BOT_TOKEN or not AUTHORIZED_USER_ID:
 AUTHORIZED_USER_ID = int(AUTHORIZED_USER_ID)
 API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 POSTS_JSON = SITE_DIR / "posts.json"
+FEED_FILE = SITE_DIR / "feed.xml"
 STATE_FILE = pathlib.Path(__file__).parent / "linkedin_state.json"
 
 TZ_LABEL = LINKEDIN_TZ.split("/")[-1]  # e.g. "Berlin"
@@ -97,6 +106,73 @@ def load_posts():
 
 def save_posts(posts):
     POSTS_JSON.write_text(json.dumps(posts, ensure_ascii=False, indent=2) + "\n")
+    try:
+        regenerate_feed(posts)
+    except Exception as e:
+        print("feed error:", e, flush=True)
+
+
+def _xml_escape(s):
+    return (s or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def _abs_url(path):
+    return f"{SITE_BASE_URL}/{path}" if SITE_BASE_URL else path
+
+
+def _rfc822(iso):
+    try:
+        dt = datetime.datetime.fromisoformat((iso or "").replace("Z", "+00:00"))
+    except Exception:
+        dt = datetime.datetime.now(datetime.timezone.utc)
+    return email.utils.format_datetime(dt)
+
+
+def regenerate_feed(posts=None):
+    """Write feed.xml (RSS 2.0) from posts. Needs an absolute SITE_BASE_URL."""
+    if not SITE_BASE_URL:
+        return
+    posts = posts if posts is not None else load_posts()
+    items = []
+    for p in posts[:50]:
+        pid = p.get("id", "")
+        link = f"{SITE_BASE_URL}/#{pid}"
+        text = (p.get("text") or "").strip()
+        title = _short(text, 90) if text else f"Dispatch {p.get('date', '')[:10]}"
+        imgs = p.get("images") or ([p["image"]] if p.get("image") else [])
+        desc = _xml_escape(text).replace("\n", "<br>")
+        for im in imgs:
+            desc += f'<br><img src="{_abs_url(im)}" alt="">'
+        enclosure = ""
+        if imgs:
+            fp = SITE_DIR / imgs[0]
+            if fp.exists():
+                enclosure = f'\n      <enclosure url="{_abs_url(imgs[0])}" length="{fp.stat().st_size}" type="image/jpeg"/>'
+        items.append(
+            "    <item>\n"
+            f"      <title>{_xml_escape(title)}</title>\n"
+            f"      <link>{link}</link>\n"
+            f'      <guid isPermaLink="false">{link}</guid>\n'
+            f"      <pubDate>{_rfc822(p.get('date', ''))}</pubDate>{enclosure}\n"
+            f"      <description><![CDATA[{desc}]]></description>\n"
+            "    </item>"
+        )
+    built = email.utils.format_datetime(datetime.datetime.now(datetime.timezone.utc))
+    xml = (
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        '<rss version="2.0" xmlns:atom="http://www.w3.org/2005/Atom">\n'
+        "  <channel>\n"
+        "    <title>What's New in China</title>\n"
+        f"    <link>{SITE_BASE_URL}</link>\n"
+        f'    <atom:link href="{SITE_BASE_URL}/feed.xml" rel="self" type="application/rss+xml"/>\n'
+        "    <description>Field dispatches from the ground in China.</description>\n"
+        "    <language>en</language>\n"
+        f"    <lastBuildDate>{built}</lastBuildDate>\n"
+        + "\n".join(items) + "\n"
+        "  </channel>\n"
+        "</rss>\n"
+    )
+    FEED_FILE.write_text(xml, encoding="utf-8")
 
 
 def load_state():
@@ -341,6 +417,127 @@ def li_enabled():
         return False
 
 
+def cap_enabled():
+    try:
+        return bool(cap and cap.enabled())
+    except Exception as e:
+        print("caption enabled() error:", e, flush=True)
+        return False
+
+
+def li_note(include):
+    if not li_enabled():
+        return ""
+    return "\nExcluded from LinkedIn." if not include else f"\nWill be in the {DAILY_HOUR:02d}:00 {TZ_LABEL} LinkedIn prompt."
+
+
+def finalize_dispatch(chat_id, tmp_paths, text, include):
+    pid, n = add_post(tmp_paths, text)
+    publish(f"post {pid}" + (f" ({n} photos)" if n > 1 else ""))
+    if not include:
+        st = load_state()
+        st.setdefault("excluded", []).append(pid)
+        save_state(st)
+    label = f"Posted {n} photos." if n > 1 else "Posted."
+    send(chat_id, f"{label} {link_for(pid)}" + li_note(include))
+
+
+# --- AI caption drafts: hold the post, show a draft with tap buttons ---
+PENDING = {}      # token -> {"paths", "draft", "include", "chat_id"}
+EDIT_TOKEN = None
+
+
+def send_kb(chat_id, text, buttons):
+    kb = {"inline_keyboard": [[{"text": l, "callback_data": d} for l, d in buttons]]}
+    try:
+        return api("sendMessage", chat_id=chat_id, text=text,
+                   reply_markup=json.dumps(kb), disable_web_page_preview="true")
+    except Exception as e:
+        print("send_kb error:", e, flush=True)
+        return {}
+
+
+def answer_cb(cb_id, text=""):
+    try:
+        api("answerCallbackQuery", callback_query_id=cb_id, text=text)
+    except Exception as e:
+        print("answer_cb error:", e, flush=True)
+
+
+def stage_draft(chat_id, tmp_paths, include):
+    token = uuid.uuid4().hex[:8]
+    paths = []
+    for i, tp in enumerate(tmp_paths):
+        pp = SITE_DIR / "images" / f"_pending-{token}-{i}.jpg"
+        os.replace(tp, pp)
+        paths.append(pp)
+    try:
+        d = cap.draft(paths)
+    except Exception as e:
+        print("caption draft error:", e, flush=True)
+        send(chat_id, f"Couldn't draft a caption ({str(e)[:120]}). Posting without one.")
+        finalize_dispatch(chat_id, paths, "", include)
+        return
+    PENDING[token] = {"paths": paths, "draft": d, "include": include, "chat_id": chat_id}
+    send_kb(chat_id, f"Draft caption:\n\n{d}",
+            [("Post", f"post:{token}"), ("Edit", f"edit:{token}"), ("Discard", f"discard:{token}")])
+
+
+def _cleanup_paths(paths):
+    for p in paths:
+        try:
+            pathlib.Path(p).unlink()
+        except Exception:
+            pass
+
+
+def handle_callback(cb):
+    global EDIT_TOKEN
+    cb_id = cb["id"]
+    data = cb.get("data", "")
+    frm = cb.get("from", {}).get("id")
+    m = cb.get("message", {})
+    chat_id = m.get("chat", {}).get("id")
+    mid = m.get("message_id")
+    if frm != AUTHORIZED_USER_ID:
+        answer_cb(cb_id, "Not authorized")
+        return
+    if ":" not in data:
+        answer_cb(cb_id)
+        return
+    action, token = data.split(":", 1)
+    pend = PENDING.get(token)
+    if not pend:
+        answer_cb(cb_id, "Draft expired")
+        try:
+            api("editMessageText", chat_id=chat_id, message_id=mid, text="(draft expired, resend the photo)")
+        except Exception:
+            pass
+        return
+    if action == "post":
+        answer_cb(cb_id, "Posting")
+        PENDING.pop(token, None)
+        try:
+            api("editMessageReplyMarkup", chat_id=chat_id, message_id=mid)
+        except Exception:
+            pass
+        finalize_dispatch(pend["chat_id"], pend["paths"], pend["draft"], pend["include"])
+    elif action == "edit":
+        EDIT_TOKEN = token
+        answer_cb(cb_id, "Send your caption")
+        send(chat_id, "Send the caption you want for this photo.")
+    elif action == "discard":
+        answer_cb(cb_id, "Discarded")
+        PENDING.pop(token, None)
+        _cleanup_paths(pend["paths"])
+        try:
+            api("editMessageText", chat_id=chat_id, message_id=mid, text="Discarded.")
+        except Exception:
+            pass
+    else:
+        answer_cb(cb_id)
+
+
 # --------------------------------------------------------------------------
 
 # --------------------------------------------------------------------------
@@ -356,9 +553,9 @@ def buffer_album(msg):
     mgid = msg["media_group_id"]
     buf = ALBUMS.setdefault(mgid, {"file_ids": [], "caption": "", "chat_id": msg["chat"]["id"], "last": 0.0})
     buf["file_ids"].append(msg["photo"][-1]["file_id"])
-    cap = (msg.get("caption") or "").strip()
-    if cap:
-        buf["caption"] = cap
+    capt = (msg.get("caption") or "").strip()
+    if capt:
+        buf["caption"] = capt
     buf["last"] = time.time()
 
 
@@ -368,22 +565,17 @@ def flush_albums(force=False):
         chat_id = buf["chat_id"]
         try:
             (SITE_DIR / "images").mkdir(parents=True, exist_ok=True)
+            tok = uuid.uuid4().hex[:8]
             tmps = []
             for i, fid in enumerate(buf["file_ids"]):
-                tmp = SITE_DIR / "images" / f"_albtmp-{i}.jpg"
+                tmp = SITE_DIR / "images" / f"_albtmp-{tok}-{i}.jpg"
                 download_photo(fid, tmp)
                 tmps.append(tmp)
             clean, include = parse_li(buf["caption"])
-            pid, n = add_post(tmps, clean)
-            publish(f"post {pid} ({n} photos)")
-            if not include:
-                state = load_state()
-                state.setdefault("excluded", []).append(pid)
-                save_state(state)
-            note = ""
-            if li_enabled():
-                note = "\nExcluded from LinkedIn." if not include else f"\nWill be in the {DAILY_HOUR:02d}:00 {TZ_LABEL} LinkedIn prompt."
-            send(chat_id, f"Posted {n} photos. {link_for(pid)}" + note)
+            if clean or not cap_enabled():
+                finalize_dispatch(chat_id, tmps, clean, include)
+            else:
+                stage_draft(chat_id, tmps, include)
         except subprocess.CalledProcessError as e:
             send(chat_id, f"Saved locally but publish failed:\n{(e.stderr or str(e))[:300]}")
         except Exception as e:
@@ -398,18 +590,30 @@ def handle(msg):
     caption = (msg.get("caption") or "").strip()
 
     if text.startswith("/start") or text.startswith("/help"):
-        send(chat_id, "Send a photo with a caption to post it to the site.\n"
-                      "Plain text also works as a text-only note.\n"
-                      f"At {DAILY_HOUR:02d}:00 {TZ_LABEL} the bot asks you for the LinkedIn "
-                      "caption, only if there are new dispatches.\n"
-                      "Add #noli to a caption to keep that dispatch out of LinkedIn.\n"
-                      "/li <caption> posts the queued dispatches to LinkedIn now.\n"
-                      "/skip passes on LinkedIn for the queued dispatches.\n"
-                      "/preview shows the queued LinkedIn links.\n"
-                      "/prompt sends the LinkedIn reminder now.\n"
-                      "/republish forces a fresh site rebuild.\n"
-                      "/undo removes the most recent post.\n"
-                      "/id shows your Telegram user id.")
+        send(chat_id,
+             "What's New in China bot\n"
+             "\n"
+             "POSTING\n"
+             "- Photo + caption: posts it to the site\n"
+             "- Photo, no caption: Claude drafts one, you approve with a tap\n"
+             "- Several photos as an album: one gallery post\n"
+             "- Plain text: a text-only note\n"
+             "- #noli in a caption: keep that one off LinkedIn\n"
+             "\n"
+             "LINKEDIN\n"
+             f"- At {DAILY_HOUR:02d}:00 {TZ_LABEL} the bot asks for a caption if there are new dispatches\n"
+             "- /li <caption> - post the queued dispatches to LinkedIn now\n"
+             "- /skip - don't post the queued dispatches to LinkedIn\n"
+             "- /preview - show the queued LinkedIn links\n"
+             "- /prompt - send the LinkedIn reminder now\n"
+             "\n"
+             "SITE\n"
+             "- /undo - remove the most recent post\n"
+             "- /republish - force a fresh site rebuild\n"
+             "\n"
+             "OTHER\n"
+             "- /help - this menu\n"
+             "- /id - your Telegram user id")
         return
     if text.startswith("/id"):
         send(chat_id, f"Your Telegram user id: {user_id}")
@@ -474,21 +678,22 @@ def handle(msg):
     if "photo" in msg:
         clean, include = parse_li(caption)
         (SITE_DIR / "images").mkdir(parents=True, exist_ok=True)
-        tmp = SITE_DIR / "images" / "_incoming.jpg"
+        tmp = SITE_DIR / "images" / f"_tmp-{uuid.uuid4().hex[:8]}.jpg"
         download_photo(msg["photo"][-1]["file_id"], tmp)
-        pid, n = add_post([tmp], clean)
-        publish(f"post {pid}")
-        if not include:
-            state = load_state()
-            state.setdefault("excluded", []).append(pid)
-            save_state(state)
-        note = ""
-        if li_enabled():
-            note = "\nExcluded from LinkedIn." if not include else f"\nWill be in the {DAILY_HOUR:02d}:00 {TZ_LABEL} LinkedIn prompt."
-        send(chat_id, f"Posted. {link_for(pid)}" + note)
+        if clean or not cap_enabled():
+            finalize_dispatch(chat_id, [tmp], clean, include)
+        else:
+            stage_draft(chat_id, [tmp], include)
         return
 
     if text and not text.startswith("/"):
+        global EDIT_TOKEN
+        # If a photo draft is awaiting an edited caption, this text is that caption.
+        if EDIT_TOKEN and EDIT_TOKEN in PENDING:
+            pend = PENDING.pop(EDIT_TOKEN)
+            EDIT_TOKEN = None
+            finalize_dispatch(pend["chat_id"], pend["paths"], text.strip(), pend["include"])
+            return
         # If the bot asked for a LinkedIn caption today, this text is the caption.
         if li_enabled() and pending_active():
             send(chat_id, compose_and_post(text))
@@ -500,17 +705,45 @@ def handle(msg):
             state = load_state()
             state.setdefault("excluded", []).append(pid)
             save_state(state)
-        note = ""
-        if li_enabled():
-            note = "\nExcluded from LinkedIn." if not include else f"\nWill be in the {DAILY_HOUR:02d}:00 {TZ_LABEL} LinkedIn prompt."
-        send(chat_id, f"Posted note. {link_for(pid)}" + note)
+        send(chat_id, f"Posted note. {link_for(pid)}" + li_note(include))
         return
 
     send(chat_id, "Send a photo with a caption, or plain text. /help for options.")
 
 
+def set_commands():
+    cmds = [
+        {"command": "help", "description": "Show all commands"},
+        {"command": "li", "description": "Post queued dispatches to LinkedIn now"},
+        {"command": "skip", "description": "Skip LinkedIn for queued dispatches"},
+        {"command": "preview", "description": "Show queued LinkedIn links"},
+        {"command": "prompt", "description": "Send the LinkedIn reminder now"},
+        {"command": "undo", "description": "Remove the most recent post"},
+        {"command": "republish", "description": "Force a fresh site rebuild"},
+        {"command": "id", "description": "Show your Telegram user id"},
+    ]
+    try:
+        api("setMyCommands", commands=json.dumps(cmds))
+    except Exception as e:
+        print("setMyCommands error:", e, flush=True)
+
+
 def main():
     print(f"china-feed bot up. SITE_DIR={SITE_DIR}", flush=True)
+    # clear any orphaned temp images from a previous run
+    for pat in ("_pending-*", "_albtmp-*", "_tmp-*", "_incoming*"):
+        for f in (SITE_DIR / "images").glob(pat):
+            try:
+                f.unlink()
+            except Exception:
+                pass
+    set_commands()
+    if cap_enabled():
+        print("AI captions enabled (draft from photo, tap to approve)", flush=True)
+    try:
+        regenerate_feed()
+    except Exception as e:
+        print("feed error:", e, flush=True)
     if li and li.enabled():
         init_li_state()
         print(f"LinkedIn reminder enabled: daily at {DAILY_HOUR:02d}:00 {LINKEDIN_TZ}", flush=True)
@@ -520,6 +753,12 @@ def main():
             resp = api("getUpdates", offset=offset, timeout=(1 if ALBUMS else 45))
             for upd in resp.get("result", []):
                 offset = upd["update_id"] + 1
+                if "callback_query" in upd:
+                    try:
+                        handle_callback(upd["callback_query"])
+                    except Exception as e:
+                        print("callback error:", e, flush=True)
+                    continue
                 msg = upd.get("message") or upd.get("channel_post")
                 if not msg:
                     continue
