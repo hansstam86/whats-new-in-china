@@ -1,18 +1,21 @@
 #!/usr/bin/env python3
 """
-One-time LinkedIn OAuth. Run this once to authorize the bot and write
-linkedin_tokens.json. After that, bot.py refreshes tokens on its own.
+One-time (and every ~60 days) LinkedIn authorization for the china-feed bot.
 
-Prereqs (in bot/.env or the environment):
+Run this to authorize link cross-posting and write linkedin_tokens.json.
+Self-serve LinkedIn apps have NO refresh token, so when the 60-day access
+token expires, just run this again. Takes about 30 seconds.
+
+Prereqs in bot/.env:
   LINKEDIN_CLIENT_ID
   LINKEDIN_CLIENT_SECRET
-  LINKEDIN_REDIRECT_URI   (must match one listed in your LinkedIn app's Auth tab;
-                           http://localhost:8000/callback works fine)
+  LINKEDIN_REDIRECT_URI   (must exactly match one in your app's Auth tab;
+                           http://localhost:8000/callback is fine)
 
 Usage:
   source .venv/bin/activate
   python linkedin_auth.py
-Then open the printed URL, approve, and paste the full redirected URL back.
+Open the printed URL, approve, then paste the full redirected address back.
 """
 
 import os
@@ -45,6 +48,7 @@ SCOPES = "openid profile w_member_social"
 
 AUTH_URL = "https://www.linkedin.com/oauth/v2/authorization"
 TOKEN_URL = "https://www.linkedin.com/oauth/v2/accessToken"
+USERINFO_URL = "https://api.linkedin.com/v2/userinfo"
 
 params = {
     "response_type": "code",
@@ -53,10 +57,10 @@ params = {
     "scope": SCOPES,
     "state": "chinafeed",
 }
-print("\n1) Open this URL, approve access:\n")
+print("\n1) Open this URL in a browser and approve access:\n")
 print(AUTH_URL + "?" + up.urlencode(params))
-print("\n2) Your browser will redirect to a URL that starts with your redirect URI.")
-print("   It will not load a page - that is fine. Copy the WHOLE address bar and paste here.\n")
+print("\n2) Your browser redirects to your redirect URI (the page will not load -")
+print("   that is expected). Copy the WHOLE address bar and paste it below.\n")
 
 redirected = input("Paste the full redirected URL: ").strip()
 qs = up.parse_qs(up.urlparse(redirected).query)
@@ -71,15 +75,26 @@ r = requests.post(TOKEN_URL, data={
     "client_id": CLIENT_ID,
     "client_secret": CLIENT_SECRET,
 }, timeout=30)
-r.raise_for_status()
+if r.status_code != 200:
+    raise SystemExit(f"Token exchange failed: {r.status_code} {r.text[:300]}")
 d = r.json()
+access = d["access_token"]
+expires_at = int(time.time()) + int(d.get("expires_in", 5184000))
+
+ui = requests.get(USERINFO_URL, headers={"Authorization": f"Bearer {access}"}, timeout=30)
+if ui.status_code != 200:
+    raise SystemExit(f"Could not read profile: {ui.status_code} {ui.text[:300]}")
+info = ui.json()
 
 tokens = {
-    "access_token": d["access_token"],
-    "refresh_token": d.get("refresh_token", ""),
-    "expires_at": int(time.time()) + int(d.get("expires_in", 5184000)),
+    "access_token": access,
+    "expires_at": expires_at,
+    "person_urn": f"urn:li:person:{info['sub']}",
+    "name": info.get("name", ""),
 }
 (HERE / "linkedin_tokens.json").write_text(json.dumps(tokens, indent=2))
-print("\nSaved linkedin_tokens.json. LinkedIn cross-posting is ready.")
-if not tokens["refresh_token"]:
-    print("Note: no refresh_token returned. Re-run this when the token expires (~60 days).")
+
+days = (expires_at - int(time.time())) // 86400
+print(f"\nSaved. Connected as {info.get('name', 'member')}. Token valid ~{days} days.")
+print("No refresh token on self-serve apps: re-run this before it expires.")
+print("The bot will warn you in Telegram when under 7 days remain.")
