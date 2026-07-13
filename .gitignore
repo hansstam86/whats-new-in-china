@@ -4,3 +4,4 @@ __pycache__/
 *.pyc
 .DS_Store
 bot/linkedin_tokens.json
+bot/.venv/
