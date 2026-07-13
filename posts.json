@@ -1,11 +1,5 @@
 [
   {
-    "id": "20260713-174804",
-    "date": "2026-07-13T17:48:04Z",
-    "text": "Xiaowei and the walled garden\n\nTencent just put its AI agent, Xiaowei, into WeChat testing. Tencent has started testing a new AI assistant for WeChat, made available to a small number of users, and users interact with it via text or voice while it taps into mini-apps. Separately Tencent already integrated WeChat Pay with its self-developed AI agent WorkBuddy, enabling a closed-loop transaction where AI initiates payments and completes fund transfers after approval. That closed loop is the real story. Huawei is collaborating with Tencent to roll out AI agent functions for WeChat, integrating WorkBuddy features into Huawei smartphones. Same with Xiaomi and Oppo. When a ByteDance-ZTE phone shipped a rival assistant, it faced pushback from rivals like WeChat and Alibaba apps over security and access rights.\n\nBeen building hardware in Shenzhen long enough to know what this means for anyone shipping a device here. If your product touches payments or mini-programs you now build against WeChat's agent layer, not just its SDK, and you play by Tencent's access rules or you get cut off like Nubia did. The super app is turning into an OS.",
-    "image": ""
-  },
-  {
     "id": "20260713-163429",
     "date": "2026-07-13T16:34:29Z",
     "text": "Found a 3D printed retractable cable spool on my desk today. USB-A on one end, USB-C on the other, textured grip shell to keep the slack wound tight. Simple print, but it solves the tangled cable problem better than most retail products I've bought.",
