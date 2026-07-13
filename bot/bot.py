@@ -141,20 +141,33 @@ def iso_now():
     return datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
 
 
-def add_post(tmp_image_path, text):
+def add_post(tmp_paths, text):
+    """tmp_paths: list of temp image file paths (0, 1, or many)."""
     posts = load_posts()
     pid = new_id()
     while any(p.get("id") == pid for p in posts):
         time.sleep(1)
         pid = new_id()
-    image_rel = ""
-    if tmp_image_path:
-        image_rel = f"images/{pid}.jpg"
+    images = []
+    if tmp_paths:
         (SITE_DIR / "images").mkdir(parents=True, exist_ok=True)
-        os.replace(tmp_image_path, SITE_DIR / image_rel)
-    posts.insert(0, {"id": pid, "date": iso_now(), "text": text, "image": image_rel})
+        if len(tmp_paths) == 1:
+            rel = f"images/{pid}.jpg"
+            os.replace(tmp_paths[0], SITE_DIR / rel)
+            images = [rel]
+        else:
+            for i, tp in enumerate(tmp_paths, 1):
+                rel = f"images/{pid}-{i}.jpg"
+                os.replace(tp, SITE_DIR / rel)
+                images.append(rel)
+    post = {"id": pid, "date": iso_now(), "text": text}
+    if len(images) > 1:
+        post["images"] = images
+    else:
+        post["image"] = images[0] if images else ""
+    posts.insert(0, post)
     save_posts(posts)
-    return pid
+    return pid, len(images)
 
 
 def link_for(pid):
@@ -321,10 +334,62 @@ def pending_active():
 
 
 def li_enabled():
-    return bool(li and li.enabled())
+    try:
+        return bool(li and li.enabled())
+    except Exception as e:
+        print("linkedin enabled() error:", e, flush=True)
+        return False
 
 
 # --------------------------------------------------------------------------
+
+# --------------------------------------------------------------------------
+# Album buffering: a Telegram album arrives as several messages sharing a
+# media_group_id, caption on the first. Buffer them and flush as one dispatch.
+# --------------------------------------------------------------------------
+
+ALBUMS = {}          # media_group_id -> {"file_ids", "caption", "chat_id", "last"}
+ALBUM_FLUSH_SEC = 2.5
+
+
+def buffer_album(msg):
+    mgid = msg["media_group_id"]
+    buf = ALBUMS.setdefault(mgid, {"file_ids": [], "caption": "", "chat_id": msg["chat"]["id"], "last": 0.0})
+    buf["file_ids"].append(msg["photo"][-1]["file_id"])
+    cap = (msg.get("caption") or "").strip()
+    if cap:
+        buf["caption"] = cap
+    buf["last"] = time.time()
+
+
+def flush_albums(force=False):
+    for mgid in [k for k, v in ALBUMS.items() if force or (time.time() - v["last"] >= ALBUM_FLUSH_SEC)]:
+        buf = ALBUMS.pop(mgid)
+        chat_id = buf["chat_id"]
+        try:
+            (SITE_DIR / "images").mkdir(parents=True, exist_ok=True)
+            tmps = []
+            for i, fid in enumerate(buf["file_ids"]):
+                tmp = SITE_DIR / "images" / f"_albtmp-{i}.jpg"
+                download_photo(fid, tmp)
+                tmps.append(tmp)
+            clean, include = parse_li(buf["caption"])
+            pid, n = add_post(tmps, clean)
+            publish(f"post {pid} ({n} photos)")
+            if not include:
+                state = load_state()
+                state.setdefault("excluded", []).append(pid)
+                save_state(state)
+            note = ""
+            if li_enabled():
+                note = "\nExcluded from LinkedIn." if not include else f"\nWill be in the {DAILY_HOUR:02d}:00 {TZ_LABEL} LinkedIn prompt."
+            send(chat_id, f"Posted {n} photos. {link_for(pid)}" + note)
+        except subprocess.CalledProcessError as e:
+            send(chat_id, f"Saved locally but publish failed:\n{(e.stderr or str(e))[:300]}")
+        except Exception as e:
+            print("album flush error:", e, flush=True)
+            send(chat_id, f"Album error: {e}")
+
 
 def handle(msg):
     chat_id = msg["chat"]["id"]
@@ -411,7 +476,7 @@ def handle(msg):
         (SITE_DIR / "images").mkdir(parents=True, exist_ok=True)
         tmp = SITE_DIR / "images" / "_incoming.jpg"
         download_photo(msg["photo"][-1]["file_id"], tmp)
-        pid = add_post(tmp, clean)
+        pid, n = add_post([tmp], clean)
         publish(f"post {pid}")
         if not include:
             state = load_state()
@@ -429,7 +494,7 @@ def handle(msg):
             send(chat_id, compose_and_post(text))
             return
         clean, include = parse_li(text)
-        pid = add_post("", clean)
+        pid, n = add_post([], clean)
         publish(f"note {pid}")
         if not include:
             state = load_state()
@@ -452,11 +517,16 @@ def main():
     offset = None
     while True:
         try:
-            resp = api("getUpdates", offset=offset, timeout=45)
+            resp = api("getUpdates", offset=offset, timeout=(1 if ALBUMS else 45))
             for upd in resp.get("result", []):
                 offset = upd["update_id"] + 1
                 msg = upd.get("message") or upd.get("channel_post")
                 if not msg:
+                    continue
+                # Album photos: buffer instead of handling one by one.
+                if (msg.get("media_group_id") and "photo" in msg
+                        and msg.get("from", {}).get("id") == AUTHORIZED_USER_ID):
+                    buffer_album(msg)
                     continue
                 try:
                     handle(msg)
@@ -471,6 +541,7 @@ def main():
                     cid = msg.get("chat", {}).get("id")
                     if cid:
                         send(cid, f"Error: {e}")
+            flush_albums()
             maybe_run_scheduler()
         except requests.exceptions.RequestException as e:
             print("poll error:", e, flush=True)
