@@ -44,6 +44,11 @@ try:
 except Exception:
     cap = None
 
+try:
+    import slack as sk
+except Exception:
+    sk = None
+
 import uuid
 
 
@@ -65,6 +70,7 @@ SITE_DIR = pathlib.Path(os.environ.get("SITE_DIR", "../")).expanduser().resolve(
 SITE_BASE_URL = os.environ.get("SITE_BASE_URL", "").strip().rstrip("/")
 LINKEDIN_TZ = os.environ.get("LINKEDIN_TZ", "Europe/Berlin").strip() or "Europe/Berlin"
 DAILY_HOUR = int(os.environ.get("LINKEDIN_DAILY_HOUR", "20") or "20")
+SLACK_DELAY = int(os.environ.get("SLACK_DELAY", "90") or "90")
 
 if not BOT_TOKEN or not AUTHORIZED_USER_ID:
     sys.exit("BOT_TOKEN and AUTHORIZED_USER_ID must be set (in bot/.env or the environment).")
@@ -463,6 +469,42 @@ def li_note(include):
     return "\nExcluded from LinkedIn." if not include else f"\nWill be in the {DAILY_HOUR:02d}:00 {TZ_LABEL} LinkedIn prompt."
 
 
+def slack_enabled():
+    try:
+        return bool(sk and sk.enabled())
+    except Exception as e:
+        print("slack enabled() error:", e, flush=True)
+        return False
+
+
+SLACK_QUEUE = []   # list of {"due", "text", "urls", "link"}
+
+
+def enqueue_slack(pid, text):
+    if not slack_enabled():
+        return
+    post = next((p for p in load_posts() if p.get("id") == pid), None)
+    if not post:
+        return
+    imgs = post.get("images") or ([post["image"]] if post.get("image") else [])
+    urls = [f"{SITE_BASE_URL}/{im}" for im in imgs if im] if SITE_BASE_URL else []
+    SLACK_QUEUE.append({"due": time.time() + SLACK_DELAY, "text": text,
+                        "urls": urls, "link": link_for(pid)})
+
+
+def flush_slack():
+    if not SLACK_QUEUE:
+        return
+    now = time.time()
+    for item in [i for i in SLACK_QUEUE if i["due"] <= now]:
+        SLACK_QUEUE.remove(item)
+        try:
+            sk.post(item["text"], item["urls"], item["link"])
+        except Exception as e:
+            print("slack post error:", e, flush=True)
+            notify(f"Slack post failed: {str(e)[:150]}")
+
+
 def finalize_dispatch(chat_id, tmp_paths, text, include):
     pid, n = add_post(tmp_paths, text)
     publish(f"post {pid}" + (f" ({n} photos)" if n > 1 else ""))
@@ -470,6 +512,7 @@ def finalize_dispatch(chat_id, tmp_paths, text, include):
         st = load_state()
         st.setdefault("excluded", []).append(pid)
         save_state(st)
+    enqueue_slack(pid, text)
     label = f"Posted {n} photos." if n > 1 else "Posted."
     send(chat_id, f"{label} {link_for(pid)}" + li_note(include))
 
@@ -847,6 +890,7 @@ def handle(msg):
             state = load_state()
             state.setdefault("excluded", []).append(pid)
             save_state(state)
+        enqueue_slack(pid, clean)
         send(chat_id, f"Posted note. {link_for(pid)}" + li_note(include))
         return
 
@@ -893,7 +937,7 @@ def main():
     offset = None
     while True:
         try:
-            resp = api("getUpdates", offset=offset, timeout=(1 if ALBUMS else 45))
+            resp = api("getUpdates", offset=offset, timeout=(1 if ALBUMS else (10 if SLACK_QUEUE else 45)))
             for upd in resp.get("result", []):
                 offset = upd["update_id"] + 1
                 if "callback_query" in upd:
@@ -924,6 +968,7 @@ def main():
                     if cid:
                         send(cid, f"Error: {e}")
             flush_albums()
+            flush_slack()
             maybe_run_scheduler()
         except requests.exceptions.RequestException as e:
             print("poll error:", e, flush=True)
