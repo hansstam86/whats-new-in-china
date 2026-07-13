@@ -477,6 +477,40 @@ def finalize_dispatch(chat_id, tmp_paths, text, include):
 # --- AI caption drafts: hold the post, show a draft with tap buttons ---
 PENDING = {}      # token -> {"paths", "draft", "include", "chat_id"}
 EDIT_TOKEN = None
+EDIT_POST_ID = None   # id of an existing post whose caption is being edited
+
+
+def delete_post(pid):
+    posts = load_posts()
+    idx = next((i for i, p in enumerate(posts) if p.get("id") == pid), None)
+    if idx is None:
+        return False
+    p = posts.pop(idx)
+    for im in (p.get("images") or ([p["image"]] if p.get("image") else [])):
+        fp = SITE_DIR / im
+        if fp.exists():
+            try:
+                fp.unlink()
+            except Exception:
+                pass
+    st = load_state()
+    if pid in st.get("excluded", []):
+        st["excluded"] = [x for x in st["excluded"] if x != pid]
+        save_state(st)
+    save_posts(posts)
+    publish(f"delete {pid}")
+    return True
+
+
+def edit_post_text(pid, new_text):
+    posts = load_posts()
+    for p in posts:
+        if p.get("id") == pid:
+            p["text"] = (new_text or "").strip()
+            save_posts(posts)
+            publish(f"edit {pid}")
+            return True
+    return False
 
 
 def send_kb(chat_id, text, buttons):
@@ -559,6 +593,31 @@ def handle_callback(cb):
         else:
             answer_cb(cb_id, "Skipped")
             send(chat_id, skip_linkedin())
+        return
+
+    # Delete / edit a specific existing post (token is the post id).
+    if action == "del":
+        answer_cb(cb_id, "Deleting")
+        try:
+            ok = delete_post(token)
+            try:
+                api("editMessageText", chat_id=chat_id, message_id=mid,
+                    text="Deleted." if ok else "Already gone.")
+            except Exception:
+                pass
+        except subprocess.CalledProcessError as e:
+            send(chat_id, f"Deleted locally but publish failed:\n{(e.stderr or str(e))[:200]}")
+        except Exception as e:
+            send(chat_id, f"Delete error: {e}")
+        return
+    if action == "ed":
+        global EDIT_POST_ID
+        if not any(p.get("id") == token for p in load_posts()):
+            answer_cb(cb_id, "Post is gone")
+            return
+        EDIT_POST_ID = token
+        answer_cb(cb_id, "Send new caption")
+        send(chat_id, "Send the new caption for this post.")
         return
 
     pend = PENDING.get(token)
@@ -663,6 +722,7 @@ def handle(msg):
              "- /prompt - send the LinkedIn reminder now\n"
              "\n"
              "SITE\n"
+             "- /list - show recent posts to edit or delete\n"
              "- /undo - remove the most recent post\n"
              "- /republish - force a fresh site rebuild\n"
              "\n"
@@ -688,7 +748,7 @@ def handle(msg):
             send(chat_id, f"Republish failed:\n{(e.stderr or str(e))[:300]}")
         return
 
-    if text.startswith("/li"):
+    if text == "/li" or text.startswith("/li "):
         body = text[3:].strip()
         if body:
             send(chat_id, compose_and_post(body))
@@ -718,18 +778,33 @@ def handle(msg):
         send(chat_id, send_prompt(manual=True))
         return
 
+    if text.startswith("/list") or text.startswith("/recent"):
+        posts = load_posts()
+        if not posts:
+            send(chat_id, "No posts yet.")
+            return
+        send(chat_id, f"Last {min(len(posts), 8)} dispatch(es). Tap Edit or Delete:")
+        for p in posts[:8]:
+            t = (p.get("text") or "").strip()
+            preview = _short(t, 80) if t else "(photo, no caption)"
+            nimg = len(p.get("images") or ([p["image"]] if p.get("image") else []))
+            tag = f" [{nimg} photos]" if nimg > 1 else (" [photo]" if nimg == 1 else "")
+            when = p.get("date", "")[:10]
+            send_kb(chat_id, f"{preview}{tag}\n{when} · {link_for(p['id'])}",
+                    [("Edit", f"ed:{p['id']}"), ("Delete", f"del:{p['id']}")])
+        return
+
     if text.startswith("/undo"):
         posts = load_posts()
         if not posts:
             send(chat_id, "Nothing to undo.")
             return
-        removed = posts.pop(0)
-        img = removed.get("image")
-        if img and (SITE_DIR / img).exists():
-            (SITE_DIR / img).unlink()
-        save_posts(posts)
-        publish(f"undo {removed.get('id')}")
-        send(chat_id, "Removed the most recent post. (If already posted on LinkedIn, that stays.)")
+        pid = posts[0].get("id")
+        try:
+            delete_post(pid)
+            send(chat_id, "Removed the most recent post. (If already posted on LinkedIn, that stays.)")
+        except subprocess.CalledProcessError as e:
+            send(chat_id, f"Removed locally but publish failed:\n{(e.stderr or str(e))[:200]}")
         return
 
     if "photo" in msg:
@@ -744,12 +819,22 @@ def handle(msg):
         return
 
     if text and not text.startswith("/"):
-        global EDIT_TOKEN
+        global EDIT_TOKEN, EDIT_POST_ID
         # If a photo draft is awaiting an edited caption, this text is that caption.
         if EDIT_TOKEN and EDIT_TOKEN in PENDING:
             pend = PENDING.pop(EDIT_TOKEN)
             EDIT_TOKEN = None
             finalize_dispatch(pend["chat_id"], pend["paths"], text.strip(), pend["include"])
+            return
+        # If editing an existing post's caption (tapped Edit on /list), apply it.
+        if EDIT_POST_ID:
+            pid = EDIT_POST_ID
+            EDIT_POST_ID = None
+            try:
+                ok = edit_post_text(pid, text)
+                send(chat_id, "Updated." if ok else "That post is gone.")
+            except subprocess.CalledProcessError as e:
+                send(chat_id, f"Updated locally but publish failed:\n{(e.stderr or str(e))[:200]}")
             return
         # If the bot asked for a LinkedIn caption today, this text is the caption.
         if li_enabled() and pending_active():
@@ -776,6 +861,7 @@ def set_commands():
         {"command": "preview", "description": "Show queued LinkedIn links"},
         {"command": "prompt", "description": "Send the LinkedIn reminder now"},
         {"command": "undo", "description": "Remove the most recent post"},
+        {"command": "list", "description": "Edit or delete a specific post"},
         {"command": "republish", "description": "Force a fresh site rebuild"},
         {"command": "id", "description": "Show your Telegram user id"},
     ]
