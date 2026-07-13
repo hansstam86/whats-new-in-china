@@ -95,6 +95,10 @@ def notify(text):
     send(AUTHORIZED_USER_ID, text)
 
 
+def notify_kb(text, buttons):
+    send_kb(AUTHORIZED_USER_ID, text, buttons)
+
+
 def load_posts():
     if POSTS_JSON.exists():
         try:
@@ -334,8 +338,8 @@ def compose_and_post(caption):
         return "No new dispatches to post."
     caption = (caption or "").strip()
     if not caption:
-        return "Send some caption text to go with the links."
-    body = f"{caption}\n\n{_links_block(batch)}"
+        return "Send some caption text to go with the link."
+    body = f"{caption}\n\n{SITE_BASE_URL}"
     try:
         li.post_text(body)
     except li.TokenExpired as e:
@@ -343,8 +347,8 @@ def compose_and_post(caption):
     except Exception as e:
         return f"LinkedIn post failed: {str(e)[:200]}"
     state["last_announced_id"] = max(p["id"] for p in batch)
-    state.pop("pending", None)
-    state.pop("pending_date", None)
+    for k in ("pending", "pending_date", "pending_draft", "pending_token"):
+        state.pop(k, None)
     save_state(state)
     d = li.days_left()
     tail = f"\nLinkedIn token: {d}d left, re-run linkedin_auth.py soon." if (d is not None and d <= 7) else ""
@@ -357,18 +361,18 @@ def skip_linkedin():
     if not batch:
         return "Nothing queued for LinkedIn."
     state["last_announced_id"] = max(p["id"] for p in batch)
-    state.pop("pending", None)
-    state.pop("pending_date", None)
+    for k in ("pending", "pending_date", "pending_draft", "pending_token"):
+        state.pop(k, None)
     save_state(state)
     return f"Skipped. {len(batch)} dispatch(es) will not be posted to LinkedIn."
 
 
 def prompt_text(batch):
-    lines = [f"- {_short(p.get('text'))}\n  {dispatch_url(p['id'])}" for p in batch]
+    lines = [f"- {_short(p.get('text'))}" for p in batch]
     return (f"{len(batch)} new dispatch(es) today. What should the LinkedIn post say?\n\n"
             + "\n".join(lines)
-            + "\n\nReply with your caption (the links get appended), or /skip.\n"
-              "Explicit: /li <caption>. See links: /preview.")
+            + f"\n\nReply with your caption. The post links to {SITE_BASE_URL} so people "
+              "see all of today's posts.\nOr /skip. Explicit: /li <caption>.")
 
 
 def send_prompt(manual=False):
@@ -382,8 +386,36 @@ def send_prompt(manual=False):
         return "No new dispatches to post." if manual else None
     state["pending"] = True
     state["pending_date"] = berlin_now().date().isoformat()
-    save_state(state)
-    notify(prompt_text(batch))
+
+    draft = None
+    if cap_enabled():
+        texts = [(p.get("text") or "").strip() for p in batch]
+        texts = [t for t in texts if t]
+        img_paths = []
+        for p in batch:
+            for im in (p.get("images") or ([p["image"]] if p.get("image") else [])):
+                fp = SITE_DIR / im
+                if fp.exists():
+                    img_paths.append(fp)
+        img_paths = img_paths[:3]
+        try:
+            draft = cap.draft_linkedin(texts, img_paths)
+        except Exception as e:
+            print("linkedin draft error:", e, flush=True)
+
+    if draft:
+        token = uuid.uuid4().hex[:8]
+        state["pending_draft"] = draft
+        state["pending_token"] = token
+        save_state(state)
+        msg = (f"{len(batch)} new dispatch(es) today. Draft LinkedIn post:\n\n{draft}\n\n"
+               f"Tap Post, or reply with your own version. Links to {SITE_BASE_URL}.")
+        notify_kb(msg, [("Post", f"lipost:{token}"), ("Skip", f"liskip:{token}")])
+    else:
+        state.pop("pending_draft", None)
+        state.pop("pending_token", None)
+        save_state(state)
+        notify(prompt_text(batch))
     return "Reminder sent." if manual else None
 
 
@@ -506,6 +538,29 @@ def handle_callback(cb):
         answer_cb(cb_id)
         return
     action, token = data.split(":", 1)
+
+    # LinkedIn daily post: Post the AI draft, or Skip. Draft lives in state.
+    if action in ("lipost", "liskip"):
+        st = load_state()
+        if st.get("pending_token") != token:
+            answer_cb(cb_id, "Expired")
+            try:
+                api("editMessageReplyMarkup", chat_id=chat_id, message_id=mid)
+            except Exception:
+                pass
+            return
+        try:
+            api("editMessageReplyMarkup", chat_id=chat_id, message_id=mid)
+        except Exception:
+            pass
+        if action == "lipost":
+            answer_cb(cb_id, "Posting")
+            send(chat_id, compose_and_post(st.get("pending_draft", "")))
+        else:
+            answer_cb(cb_id, "Skipped")
+            send(chat_id, skip_linkedin())
+        return
+
     pend = PENDING.get(token)
     if not pend:
         answer_cb(cb_id, "Draft expired")
@@ -601,7 +656,7 @@ def handle(msg):
              "- #noli in a caption: keep that one off LinkedIn\n"
              "\n"
              "LINKEDIN\n"
-             f"- At {DAILY_HOUR:02d}:00 {TZ_LABEL} the bot asks for a caption if there are new dispatches\n"
+             f"- At {DAILY_HOUR:02d}:00 {TZ_LABEL} the bot drafts a LinkedIn post you approve (if there are new dispatches)\n"
              "- /li <caption> - post the queued dispatches to LinkedIn now\n"
              "- /skip - don't post the queued dispatches to LinkedIn\n"
              "- /preview - show the queued LinkedIn links\n"
@@ -634,11 +689,11 @@ def handle(msg):
         return
 
     if text.startswith("/li"):
-        cap = text[3:].strip()
-        if not cap:
-            send(chat_id, "Usage: /li your caption here")
+        body = text[3:].strip()
+        if body:
+            send(chat_id, compose_and_post(body))
         else:
-            send(chat_id, compose_and_post(cap))
+            send(chat_id, send_prompt(manual=True))
         return
 
     if text.startswith("/skip"):
@@ -653,8 +708,10 @@ def handle(msg):
         if not batch:
             send(chat_id, "Nothing queued for LinkedIn.")
         else:
-            send(chat_id, "Queued links:\n\n" + _links_block(batch)
-                 + "\n\nReply with a caption or /li <caption> to post.")
+            lines = "\n".join(f"- {_short(p.get('text'))}" for p in batch)
+            send(chat_id, f"{len(batch)} dispatch(es) queued:\n\n{lines}\n\n"
+                          f"The post will link to {SITE_BASE_URL}\n"
+                          "Reply with a caption or /li <caption> to post.")
         return
 
     if text.startswith("/prompt"):
