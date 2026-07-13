@@ -6,10 +6,14 @@ Send the bot a photo with a caption (or plain text). It saves the photo into
 the site repo, appends the post to posts.json, then git commits and pushes.
 GitHub Pages does the rest.
 
-LinkedIn (optional): instead of posting each link immediately, the bot posts ONE
-roundup per day at 20:00 Europe/Berlin, covering that day's new dispatches, and
-only if there are any. Put #noli in a caption to keep that dispatch out of the
-roundup. Commands: /roundup posts now, /preview shows tonight's text.
+LinkedIn (optional, human in the loop): at 20:00 Europe/Berlin, if there are new
+dispatches that day, the bot messages you a reminder and asks for the caption.
+You reply with the words; the bot appends the dispatch links and posts it. Put
+#noli in a caption to keep that dispatch out of LinkedIn.
+
+LinkedIn commands: reply with text after the reminder to post, or use
+/li <caption> anytime, /skip to pass, /preview to see the queued links,
+/prompt to trigger the reminder now.
 
 Runs on the Mac mini via long-polling. No public URL / webhook needed.
 """
@@ -62,19 +66,7 @@ API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 POSTS_JSON = SITE_DIR / "posts.json"
 STATE_FILE = pathlib.Path(__file__).parent / "linkedin_state.json"
 
-# ============================================================================
-# EDIT YOUR LINKEDIN COPY HERE
-# {date} -> e.g. "13 July"   {site} -> your site URL   {n} -> number of items
-# ============================================================================
-LI_HEADER = "What's new in China \u2014 {date}"
-LI_MULTI_INTRO = "{n} things that caught my eye on the ground today:"
-LI_FOOTER = "Full feed \u2192 {site}"
-LI_HASHTAGS = "#China #Shenzhen #hardware #manufacturing #supplychain"
-LI_MAX_ITEMS = 10  # if a day has more, list this many and add "+N more"
-# ============================================================================
-
-MONTHS = ["January", "February", "March", "April", "May", "June", "July",
-          "August", "September", "October", "November", "December"]
+TZ_LABEL = LINKEDIN_TZ.split("/")[-1]  # e.g. "Berlin"
 
 
 def api(method, **params):
@@ -174,7 +166,7 @@ def dispatch_url(pid):
 
 
 def parse_li(text):
-    """Return (clean_text, include_in_roundup). '#noli' excludes the dispatch."""
+    """Return (clean_text, include_in_linkedin). '#noli' excludes the dispatch."""
     if "#noli" in text.lower():
         cleaned = " ".join(w for w in text.split() if w.lower() != "#noli").strip()
         return cleaned, False
@@ -182,7 +174,7 @@ def parse_li(text):
 
 
 # --------------------------------------------------------------------------
-# LinkedIn daily roundup
+# LinkedIn: reminder + you-compose flow
 # --------------------------------------------------------------------------
 
 def berlin_now():
@@ -194,49 +186,38 @@ def berlin_now():
     return datetime.datetime.now()
 
 
-def _fmt_date(dt):
-    return f"{dt.day} {MONTHS[dt.month - 1]}"
+def _berlin_date(iso):
+    try:
+        dt = datetime.datetime.fromisoformat((iso or "").replace("Z", "+00:00"))
+    except Exception:
+        return None
+    if ZoneInfo is not None:
+        try:
+            dt = dt.astimezone(ZoneInfo(LINKEDIN_TZ))
+        except Exception:
+            pass
+    return dt.date().isoformat()
 
 
-def _short(s, n=100):
+def _short(s, n=90):
     s = (s or "").strip()
     s = s.splitlines()[0] if s else "New dispatch"
     return s if len(s) <= n else s[:n - 1].rstrip() + "\u2026"
 
 
-def build_digest(batch):
-    """batch is oldest-first, already filtered."""
-    date = _fmt_date(berlin_now())
-    header = LI_HEADER.format(date=date)
-    footer = LI_FOOTER.format(site=SITE_BASE_URL)
-
-    if len(batch) == 1:
-        p = batch[0]
-        cap = (p.get("text") or "").strip() or "New dispatch from the ground."
-        return f"{header}\n\n{cap}\n\n{dispatch_url(p['id'])}\n\n{footer}\n{LI_HASHTAGS}"
-
-    shown = batch[:LI_MAX_ITEMS]
-    overflow = len(batch) - len(shown)
-    intro = LI_MULTI_INTRO.format(n=len(batch))
-    lines = [f"\u2022 {_short(p.get('text'))}\n  {dispatch_url(p['id'])}" for p in shown]
-    body = "\n".join(lines)
-    if overflow > 0:
-        body += f"\n\n+{overflow} more \u2192 {SITE_BASE_URL}"
-    return f"{header}\n\n{intro}\n\n{body}\n\n{footer}\n{LI_HASHTAGS}"
-
-
-def _eligible_batch(state):
+def eligible_batch(state=None):
     """Un-announced, non-excluded dispatches, oldest-first."""
+    state = state if state is not None else load_state()
     last = state.get("last_announced_id", "")
     excluded = set(state.get("excluded", []))
     posts = load_posts()
     batch = [p for p in posts if p.get("id", "") > last and p.get("id") not in excluded]
-    return list(reversed(batch))  # oldest-first for reading order
+    return list(reversed(batch))
 
 
 def init_li_state():
     """On first enable, don't backfill history: only today's dispatches (Berlin)
-    are eligible for tonight's first roundup; everything older is marked done."""
+    are eligible; everything older is marked already announced."""
     state = load_state()
     if "last_announced_id" in state:
         return state
@@ -248,36 +229,73 @@ def init_li_state():
     return state
 
 
-def run_roundup(manual=False, mark_today=None):
-    """Post the day's roundup. Returns a short status string."""
+def _links_block(batch):
+    return "\n".join(dispatch_url(p["id"]) for p in batch if dispatch_url(p["id"]))
+
+
+def compose_and_post(caption):
+    """Post the caption + the eligible dispatch links to LinkedIn."""
     if not (li and li.enabled()):
-        return "LinkedIn not configured."
+        return "LinkedIn is not set up. See bot/LINKEDIN.md."
     if not SITE_BASE_URL:
         return "SITE_BASE_URL not set."
-
     state = load_state()
-    batch = _eligible_batch(state)
-    if mark_today:
-        state["last_fired_date"] = mark_today  # scheduled run: don't retry all day
-
+    batch = eligible_batch(state)
     if not batch:
-        save_state(state)
-        return "No new dispatches for today."
-
-    text = build_digest(batch)
+        return "No new dispatches to post."
+    caption = (caption or "").strip()
+    if not caption:
+        return "Send some caption text to go with the links."
+    body = f"{caption}\n\n{_links_block(batch)}"
     try:
-        li.post_text(text)
-        state["last_announced_id"] = max(p["id"] for p in batch)
-        save_state(state)
-        d = li.days_left()
-        tail = f" (LinkedIn token: {d}d left, re-run linkedin_auth.py soon.)" if (d is not None and d <= 7) else ""
-        return f"Posted LinkedIn roundup: {len(batch)} dispatch(es).{tail}"
+        li.post_text(body)
     except li.TokenExpired as e:
-        save_state(state)  # keep last_announced_id so it retries after re-auth
-        return f"LinkedIn roundup not posted: {e}"
+        return f"Not posted: {e}. Re-run linkedin_auth.py, then resend."
     except Exception as e:
-        save_state(state)
-        return f"LinkedIn roundup failed: {str(e)[:200]}"
+        return f"LinkedIn post failed: {str(e)[:200]}"
+    state["last_announced_id"] = max(p["id"] for p in batch)
+    state.pop("pending", None)
+    state.pop("pending_date", None)
+    save_state(state)
+    d = li.days_left()
+    tail = f"\nLinkedIn token: {d}d left, re-run linkedin_auth.py soon." if (d is not None and d <= 7) else ""
+    return f"Posted to LinkedIn: {len(batch)} dispatch(es).{tail}"
+
+
+def skip_linkedin():
+    state = load_state()
+    batch = eligible_batch(state)
+    if not batch:
+        return "Nothing queued for LinkedIn."
+    state["last_announced_id"] = max(p["id"] for p in batch)
+    state.pop("pending", None)
+    state.pop("pending_date", None)
+    save_state(state)
+    return f"Skipped. {len(batch)} dispatch(es) will not be posted to LinkedIn."
+
+
+def prompt_text(batch):
+    lines = [f"- {_short(p.get('text'))}\n  {dispatch_url(p['id'])}" for p in batch]
+    return (f"{len(batch)} new dispatch(es) today. What should the LinkedIn post say?\n\n"
+            + "\n".join(lines)
+            + "\n\nReply with your caption (the links get appended), or /skip.\n"
+              "Explicit: /li <caption>. See links: /preview.")
+
+
+def send_prompt(manual=False):
+    if not (li and li.enabled()):
+        return "LinkedIn is not set up. See bot/LINKEDIN.md." if manual else None
+    if not SITE_BASE_URL:
+        return "SITE_BASE_URL not set." if manual else None
+    state = load_state()
+    batch = eligible_batch(state)
+    if not batch:
+        return "No new dispatches to post." if manual else None
+    state["pending"] = True
+    state["pending_date"] = berlin_now().date().isoformat()
+    save_state(state)
+    notify(prompt_text(batch))
+    return "Reminder sent." if manual else None
 
 
 def maybe_run_scheduler():
@@ -286,22 +304,27 @@ def maybe_run_scheduler():
     now = berlin_now()
     today = now.strftime("%Y-%m-%d")
     state = load_state()
-    if now.hour >= DAILY_HOUR and state.get("last_fired_date") != today:
-        status = run_roundup(manual=False, mark_today=today)
-        # stay quiet on the "nothing new" case; only ping on a real post or error
-        if not status.startswith("No new"):
-            notify(status)
+    if now.hour < DAILY_HOUR or state.get("last_fired_date") == today:
+        return
+    batch = eligible_batch(state)
+    today_iso = now.date().isoformat()
+    has_new_today = any(_berlin_date(p.get("date")) == today_iso for p in batch)
+    state["last_fired_date"] = today
+    save_state(state)
+    if batch and has_new_today:
+        send_prompt(manual=False)
+
+
+def pending_active():
+    state = load_state()
+    return bool(state.get("pending")) and state.get("pending_date") == berlin_now().date().isoformat()
+
+
+def li_enabled():
+    return bool(li and li.enabled())
 
 
 # --------------------------------------------------------------------------
-
-def roundup_note(include):
-    if not (li and li.enabled()):
-        return ""
-    if not include:
-        return "\nExcluded from LinkedIn."
-    return f"\nQueued for the {DAILY_HOUR:02d}:00 {LINKEDIN_TZ.split('/')[-1]} LinkedIn roundup."
-
 
 def handle(msg):
     chat_id = msg["chat"]["id"]
@@ -312,12 +335,14 @@ def handle(msg):
     if text.startswith("/start") or text.startswith("/help"):
         send(chat_id, "Send a photo with a caption to post it to the site.\n"
                       "Plain text also works as a text-only note.\n"
-                      f"LinkedIn posts one roundup daily at {DAILY_HOUR:02d}:00 "
-                      f"{LINKEDIN_TZ.split('/')[-1]}, only if there are new dispatches.\n"
+                      f"At {DAILY_HOUR:02d}:00 {TZ_LABEL} the bot asks you for the LinkedIn "
+                      "caption, only if there are new dispatches.\n"
                       "Add #noli to a caption to keep that dispatch out of LinkedIn.\n"
-                      "/roundup posts the LinkedIn roundup now.\n"
+                      "/li <caption> posts the queued dispatches to LinkedIn now.\n"
+                      "/skip passes on LinkedIn for the queued dispatches.\n"
+                      "/preview shows the queued LinkedIn links.\n"
+                      "/prompt sends the LinkedIn reminder now.\n"
                       "/republish forces a fresh site rebuild.\n"
-                      "/preview shows tonight's roundup text without posting.\n"
                       "/undo removes the most recent post.\n"
                       "/id shows your Telegram user id.")
         return
@@ -339,19 +364,32 @@ def handle(msg):
             send(chat_id, f"Republish failed:\n{(e.stderr or str(e))[:300]}")
         return
 
-    if text.startswith("/roundup"):
-        send(chat_id, run_roundup(manual=True))
+    if text.startswith("/li"):
+        cap = text[3:].strip()
+        if not cap:
+            send(chat_id, "Usage: /li your caption here")
+        else:
+            send(chat_id, compose_and_post(cap))
+        return
+
+    if text.startswith("/skip"):
+        send(chat_id, skip_linkedin())
         return
 
     if text.startswith("/preview"):
         if not SITE_BASE_URL:
             send(chat_id, "SITE_BASE_URL not set.")
             return
-        batch = _eligible_batch(load_state())
+        batch = eligible_batch()
         if not batch:
-            send(chat_id, "Nothing queued for the next roundup.")
+            send(chat_id, "Nothing queued for LinkedIn.")
         else:
-            send(chat_id, "Tonight's roundup would read:\n\n" + build_digest(batch))
+            send(chat_id, "Queued links:\n\n" + _links_block(batch)
+                 + "\n\nReply with a caption or /li <caption> to post.")
+        return
+
+    if text.startswith("/prompt"):
+        send(chat_id, send_prompt(manual=True))
         return
 
     if text.startswith("/undo"):
@@ -365,7 +403,7 @@ def handle(msg):
             (SITE_DIR / img).unlink()
         save_posts(posts)
         publish(f"undo {removed.get('id')}")
-        send(chat_id, "Removed the most recent post. (If already announced on LinkedIn, that post stays.)")
+        send(chat_id, "Removed the most recent post. (If already posted on LinkedIn, that stays.)")
         return
 
     if "photo" in msg:
@@ -379,10 +417,17 @@ def handle(msg):
             state = load_state()
             state.setdefault("excluded", []).append(pid)
             save_state(state)
-        send(chat_id, f"Posted. {link_for(pid)}" + roundup_note(include))
+        note = ""
+        if li_enabled():
+            note = "\nExcluded from LinkedIn." if not include else f"\nWill be in the {DAILY_HOUR:02d}:00 {TZ_LABEL} LinkedIn prompt."
+        send(chat_id, f"Posted. {link_for(pid)}" + note)
         return
 
     if text and not text.startswith("/"):
+        # If the bot asked for a LinkedIn caption today, this text is the caption.
+        if li_enabled() and pending_active():
+            send(chat_id, compose_and_post(text))
+            return
         clean, include = parse_li(text)
         pid = add_post("", clean)
         publish(f"note {pid}")
@@ -390,7 +435,10 @@ def handle(msg):
             state = load_state()
             state.setdefault("excluded", []).append(pid)
             save_state(state)
-        send(chat_id, f"Posted note. {link_for(pid)}" + roundup_note(include))
+        note = ""
+        if li_enabled():
+            note = "\nExcluded from LinkedIn." if not include else f"\nWill be in the {DAILY_HOUR:02d}:00 {TZ_LABEL} LinkedIn prompt."
+        send(chat_id, f"Posted note. {link_for(pid)}" + note)
         return
 
     send(chat_id, "Send a photo with a caption, or plain text. /help for options.")
@@ -400,7 +448,7 @@ def main():
     print(f"china-feed bot up. SITE_DIR={SITE_DIR}", flush=True)
     if li and li.enabled():
         init_li_state()
-        print(f"LinkedIn roundup enabled: daily at {DAILY_HOUR:02d}:00 {LINKEDIN_TZ}", flush=True)
+        print(f"LinkedIn reminder enabled: daily at {DAILY_HOUR:02d}:00 {LINKEDIN_TZ}", flush=True)
     offset = None
     while True:
         try:
