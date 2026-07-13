@@ -79,6 +79,11 @@
     box-shadow: var(--shadow); cursor: zoom-in;
     border: 1px solid var(--line);
   }
+  .gallery {
+    display: grid; grid-template-columns: repeat(2, 1fr); gap: 6px;
+  }
+  .gallery .shot { aspect-ratio: 1 / 1; object-fit: cover; box-shadow: none; }
+  .gallery .shot:only-child { aspect-ratio: auto; }
   .note {
     margin: 18px 2px 0; font-size: 18.5px; line-height: 1.58;
     white-space: pre-wrap; word-wrap: break-word;
@@ -194,13 +199,17 @@
       art.className = 'dispatch reveal';
       art.id = p.id || '';
       let html = `<div class="meta"><span class="serial">${esc(serial(p.id, p.date))}</span><span class="stamp">${fmtStamp(p.date)}</span></div>`;
-      if (p.image) {
-        html += `<img class="shot" src="${esc(p.image)}" alt="${esc(p.text ? p.text.slice(0,80) : 'dispatch photo')}" loading="lazy" />`;
+      const imgs = Array.isArray(p.images) ? p.images : (p.image ? [p.image] : []);
+      if (imgs.length === 1) {
+        html += `<img class="shot" src="${esc(imgs[0])}" alt="${esc(p.text ? p.text.slice(0,80) : 'dispatch photo')}" loading="lazy" />`;
+      } else if (imgs.length > 1) {
+        html += `<div class="gallery">` +
+          imgs.map(src => `<img class="shot" src="${esc(src)}" alt="dispatch photo" loading="lazy" />`).join("") +
+          `</div>`;
       }
       if (p.text) html += `<div class="note">${esc(p.text)}</div>`;
       art.innerHTML = html;
-      const img = art.querySelector('.shot');
-      if (img) img.addEventListener('click', () => openBox(img.src));
+      art.querySelectorAll('.shot').forEach(im => im.addEventListener('click', () => openBox(im.src)));
       feed.appendChild(art);
       if (io) io.observe(art); else art.classList.add('in');
     });
