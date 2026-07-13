@@ -1,0 +1,222 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>What's New in China — Field Dispatches</title>
+<meta name="description" content="Field dispatches from the ground in China. Photos and notes, straight from the source." />
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&family=Newsreader:ital,opsz,wght@0,6..72,400;0,6..72,500;1,6..72,400&display=swap" rel="stylesheet" />
+<style>
+  :root {
+    --paper: #ECEBE4;
+    --card: #F6F5F0;
+    --ink: #191713;
+    --muted: #817C6F;
+    --seal: #C13B2F;
+    --seal-deep: #98291F;
+    --line: #D6D4C8;
+    --shadow: 0 1px 0 rgba(25,23,19,.04), 0 8px 24px rgba(25,23,19,.06);
+  }
+  * { box-sizing: border-box; }
+  html { -webkit-text-size-adjust: 100%; }
+  body {
+    margin: 0;
+    background: var(--paper);
+    color: var(--ink);
+    font-family: "Newsreader", Georgia, serif;
+    font-size: 18px;
+    line-height: 1.55;
+    -webkit-font-smoothing: antialiased;
+  }
+  .wrap { max-width: 620px; margin: 0 auto; padding: 0 20px 96px; }
+
+  /* Masthead */
+  header { padding: 56px 0 28px; }
+  .kicker {
+    font-family: "JetBrains Mono", monospace;
+    font-size: 11px; letter-spacing: .28em; text-transform: uppercase;
+    color: var(--seal); margin: 0 0 14px;
+  }
+  h1 {
+    font-family: "JetBrains Mono", monospace;
+    font-weight: 700; font-size: clamp(26px, 7vw, 40px);
+    letter-spacing: -.01em; line-height: 1.02; margin: 0;
+    text-transform: uppercase;
+  }
+  h1 .cn { display: block; font-weight: 500; font-size: .5em; letter-spacing: .1em; color: var(--muted); margin-top: 10px; }
+  .lede {
+    margin: 20px 0 0; max-width: 46ch;
+    color: #45413a; font-size: 17px;
+  }
+  .status {
+    font-family: "JetBrains Mono", monospace;
+    font-size: 11px; letter-spacing: .12em; text-transform: uppercase;
+    color: var(--muted); margin-top: 22px;
+    display: flex; gap: 16px; flex-wrap: wrap; align-items: center;
+  }
+  .status .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--seal); display: inline-block; margin-right: 7px; vertical-align: middle; }
+  .rule { border: 0; border-top: 1px solid var(--line); margin: 28px 0 0; }
+
+  /* Feed */
+  main { margin-top: 8px; }
+  .dispatch {
+    padding: 32px 0;
+    border-bottom: 1px solid var(--line);
+  }
+  .meta {
+    font-family: "JetBrains Mono", monospace;
+    font-size: 11px; letter-spacing: .1em; text-transform: uppercase;
+    display: flex; gap: 14px; align-items: baseline;
+    margin-bottom: 16px;
+  }
+  .serial { color: var(--seal); font-weight: 500; }
+  .stamp { color: var(--muted); }
+  .shot {
+    display: block; width: 100%; height: auto;
+    border-radius: 2px; background: var(--card);
+    box-shadow: var(--shadow); cursor: zoom-in;
+    border: 1px solid var(--line);
+  }
+  .note {
+    margin: 18px 2px 0; font-size: 18.5px; line-height: 1.58;
+    white-space: pre-wrap; word-wrap: break-word;
+  }
+  .note:empty { display: none; }
+
+  /* Empty + loading */
+  .placeholder {
+    font-family: "JetBrains Mono", monospace;
+    font-size: 13px; letter-spacing: .04em; color: var(--muted);
+    padding: 48px 0; text-align: left; line-height: 1.7;
+  }
+  .placeholder b { color: var(--ink); font-weight: 500; }
+
+  /* Footer */
+  footer {
+    margin-top: 40px; padding-top: 22px; border-top: 1px solid var(--line);
+    font-family: "JetBrains Mono", monospace;
+    font-size: 11px; letter-spacing: .1em; text-transform: uppercase;
+    color: var(--muted);
+  }
+
+  /* Lightbox */
+  .box {
+    position: fixed; inset: 0; background: rgba(20,18,14,.92);
+    display: none; align-items: center; justify-content: center;
+    padding: 24px; cursor: zoom-out; z-index: 50;
+  }
+  .box.open { display: flex; }
+  .box img { max-width: 100%; max-height: 100%; border-radius: 2px; }
+
+  .dispatch:target { animation: flash 1.4s ease; }
+  @keyframes flash { 0% { background: rgba(193,59,47,.08); } 100% { background: transparent; } }
+
+  .reveal { opacity: 0; transform: translateY(10px); transition: opacity .5s ease, transform .5s ease; }
+  .reveal.in { opacity: 1; transform: none; }
+  @media (prefers-reduced-motion: reduce) {
+    .reveal { opacity: 1; transform: none; transition: none; }
+    .dispatch:target { animation: none; }
+  }
+</style>
+</head>
+<body>
+  <div class="wrap">
+    <header>
+      <p class="kicker">Field dispatches · from the ground</p>
+      <h1>What's New<br />in China<span class="cn">新鲜出炉 · 现场直击</span></h1>
+      <p class="lede">Photos and short notes on what I'm seeing on the ground in China. Posted as I spot them.</p>
+      <div class="status">
+        <span><span class="dot"></span><span id="count">—</span> dispatches</span>
+        <span id="updated"></span>
+      </div>
+      <hr class="rule" />
+    </header>
+
+    <main id="feed">
+      <div class="placeholder" id="loading">Loading dispatches…</div>
+    </main>
+
+    <footer>
+      Hans Stam · <span id="year"></span> · updates when I post
+    </footer>
+  </div>
+
+  <div class="box" id="lightbox"><img id="lightbox-img" alt="" /></div>
+
+<script>
+  const feed = document.getElementById('feed');
+  const box = document.getElementById('lightbox');
+  const boxImg = document.getElementById('lightbox-img');
+  document.getElementById('year').textContent = new Date().getUTCFullYear();
+
+  const MONTHS = ['JAN','FEB','MAR','APR','MAY','JUN','JUL','AUG','SEP','OCT','NOV','DEC'];
+
+  function fmtStamp(iso) {
+    const d = new Date(iso);
+    if (isNaN(d)) return '';
+    const pad = n => String(n).padStart(2, '0');
+    return `${pad(d.getUTCDate())} ${MONTHS[d.getUTCMonth()]} ${d.getUTCFullYear()} · ${pad(d.getUTCHours())}:${pad(d.getUTCMinutes())} UTC`;
+  }
+  function serial(id, iso) {
+    if (id && /^\d{8}-\d{6}$/.test(id)) return `CN·${id.slice(0,8)}·${id.slice(9,13)}`;
+    const d = new Date(iso); const pad = n => String(n).padStart(2,'0');
+    return `CN·${d.getUTCFullYear()}${pad(d.getUTCMonth()+1)}${pad(d.getUTCDate())}·${pad(d.getUTCHours())}${pad(d.getUTCMinutes())}`;
+  }
+  function esc(s) {
+    return (s || '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+  }
+
+  function openBox(src) { boxImg.src = src; box.classList.add('open'); }
+  function closeBox() { box.classList.remove('open'); boxImg.src = ''; }
+  box.addEventListener('click', closeBox);
+  document.addEventListener('keydown', e => { if (e.key === 'Escape') closeBox(); });
+
+  function render(posts) {
+    document.getElementById('count').textContent = posts.length;
+    if (posts.length) {
+      document.getElementById('updated').textContent = 'last ' + fmtStamp(posts[0].date);
+    }
+    feed.innerHTML = '';
+
+    if (!posts.length) {
+      feed.innerHTML = '<div class="placeholder">No dispatches yet.<br />The feed fills in as I post from the ground. <b>Check back soon.</b></div>';
+      return;
+    }
+
+    const io = ('IntersectionObserver' in window) ? new IntersectionObserver((entries, obs) => {
+      entries.forEach(e => { if (e.isIntersecting) { e.target.classList.add('in'); obs.unobserve(e.target); } });
+    }, { rootMargin: '0px 0px -8% 0px' }) : null;
+
+    posts.forEach(p => {
+      const art = document.createElement('article');
+      art.className = 'dispatch reveal';
+      art.id = p.id || '';
+      let html = `<div class="meta"><span class="serial">${esc(serial(p.id, p.date))}</span><span class="stamp">${fmtStamp(p.date)}</span></div>`;
+      if (p.image) {
+        html += `<img class="shot" src="${esc(p.image)}" alt="${esc(p.text ? p.text.slice(0,80) : 'dispatch photo')}" loading="lazy" />`;
+      }
+      if (p.text) html += `<div class="note">${esc(p.text)}</div>`;
+      art.innerHTML = html;
+      const img = art.querySelector('.shot');
+      if (img) img.addEventListener('click', () => openBox(img.src));
+      feed.appendChild(art);
+      if (io) io.observe(art); else art.classList.add('in');
+    });
+
+    if (location.hash) {
+      const t = document.getElementById(location.hash.slice(1));
+      if (t) t.scrollIntoView();
+    }
+  }
+
+  fetch('posts.json?_=' + Date.now())
+    .then(r => r.ok ? r.json() : [])
+    .then(data => render(Array.isArray(data) ? data : []))
+    .catch(() => {
+      feed.innerHTML = '<div class="placeholder">Could not load the feed right now. Refresh to try again.</div>';
+    });
+</script>
+</body>
+</html>

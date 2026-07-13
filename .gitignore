@@ -1,0 +1,6 @@
+bot/.env
+bot/*.plist
+__pycache__/
+*.pyc
+.DS_Store
+bot/linkedin_tokens.json
